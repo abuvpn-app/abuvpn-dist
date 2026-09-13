@@ -1,0 +1,59 @@
+name: ABUvpn watchdog
+# Внешний страж флота ABUvpn: каждые 15 минут проверяет панель и все узлы
+# из облака GitHub. Нужен на случай падения САМОГО сервера с Uptime Kuma:
+# Kuma не может пожаловаться на свою смерть -- этот воркер может.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Отправить тестовое сообщение в Telegram'
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Проверка серверов
+        env:
+          BOT_TOKEN: ${{ secrets.WATCH_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.WATCH_CHAT_ID }}
+          TEST: ${{ inputs.test_alert }}
+        run: |
+          FAILED=""
+          check() { # имя, url
+            code=$(curl -sk -o /dev/null --max-time 20 -w '%{http_code}' "$2" || echo 000)
+            if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then
+              FAILED="$FAILED\n❌ $1 — недоступен (HTTP $code)"
+            fi
+          }
+          check_tcp() { # имя, хост, порт
+            if ! timeout 10 bash -c "cat < /dev/null > /dev/tcp/$2/$3" 2>/dev/null; then
+              FAILED="$FAILED\n❌ $1 — порт $3 закрыт"
+            fi
+          }
+          check "Панель ABUvpn (сайт)" "https://panel.172-86-91-247.sslip.io:8443/releases/qt-version.json"
+          check "Uptime Kuma (страж)" "https://panel.172-86-91-247.sslip.io:8444/"
+          check_tcp "Сервер 1 (xray)" 172.86.91.247 443
+          check_tcp "Сервер 2 (xray)" 167.88.168.196 443
+          check_tcp "Сервер 3 (xray)" 167.88.165.156 443
+          check_tcp "сервер4 (xray)" 172.86.122.90 443
+
+          if [ "$TEST" = "true" ]; then
+            FAILED="${FAILED}\n✅ Тестовая проверка воркера: всё живо (сообщение означает, что алерты работают)"
+          fi
+
+          if [ -n "$FAILED" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="$CHAT_ID" \
+              -d text="🛡 <b>ABUvpn watchdog (GitHub)</b>${FAILED}" \
+              -d parse_mode=HTML > /dev/null
+            echo -e "Проблемы:${FAILED}"
+            # не падаем задачей: уведомление важнее красной галочки
+          else
+            echo "Все серверы живы."
+          fi
